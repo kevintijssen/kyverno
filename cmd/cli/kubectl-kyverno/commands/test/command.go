@@ -14,9 +14,8 @@ import (
 	"github.com/kyverno/kyverno/cmd/cli/kubectl-kyverno/report"
 	"github.com/kyverno/kyverno/cmd/cli/kubectl-kyverno/test/filter"
 	engineapi "github.com/kyverno/kyverno/pkg/engine/api"
-	"github.com/sergi/go-diff/diffmatchpatch"
 	"github.com/spf13/cobra"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/client-go/tools/cache"
 )
 
 func Command() *cobra.Command {
@@ -126,7 +125,7 @@ func testCommandExecute(
 			if err := printTestResult(filteredResults, responses, rc, &resultsTable, test.Fs, resourcePath); err != nil {
 				return fmt.Errorf("failed to print test result (%w)", err)
 			}
-			if err := printCheckResult(test.Test.Checks, *responses, rc, &resultsTable); err != nil {
+			if err := printCheckResult(test.Test.Checks, responses, rc, &resultsTable); err != nil {
 				return fmt.Errorf("failed to print test result (%w)", err)
 			}
 			fullTable.AddFailed(resultsTable.RawRows...)
@@ -151,7 +150,7 @@ func testCommandExecute(
 	return nil
 }
 
-func checkResult(test v1alpha1.TestResult, fs billy.Filesystem, resoucePath string, response engineapi.EngineResponse, rule engineapi.RuleResponse, actualResource unstructured.Unstructured) (bool, string, string) {
+func checkResult(test v1alpha1.TestResult, fs billy.Filesystem, resoucePath string, response engineapi.EngineResponse, rule engineapi.RuleResponse) (bool, string, string) {
 	expected := test.Result
 	// fallback to the deprecated field
 	if expected == "" {
@@ -159,25 +158,21 @@ func checkResult(test v1alpha1.TestResult, fs billy.Filesystem, resoucePath stri
 	}
 	// fallback on deprecated field
 	if test.PatchedResource != "" {
-		equals, diff, err := getAndCompareResource(actualResource, fs, filepath.Join(resoucePath, test.PatchedResource))
+		equals, err := getAndCompareResource(response.PatchedResource, fs, filepath.Join(resoucePath, test.PatchedResource))
 		if err != nil {
 			return false, err.Error(), "Resource error"
 		}
 		if !equals {
-			dmp := diffmatchpatch.New()
-			legend := dmp.DiffPrettyText(dmp.DiffMain("only in expected", "only in actual", false))
-			return false, fmt.Sprintf("Patched resource didn't match the patched resource in the test result\n(%s)\n\n%s", legend, diff), "Resource diff"
+			return false, "Patched resource didn't match the patched resource in the test result", "Resource diff"
 		}
 	}
 	if test.GeneratedResource != "" {
-		equals, diff, err := getAndCompareResource(actualResource, fs, filepath.Join(resoucePath, test.GeneratedResource))
+		equals, err := getAndCompareResource(rule.GeneratedResource(), fs, filepath.Join(resoucePath, test.GeneratedResource))
 		if err != nil {
 			return false, err.Error(), "Resource error"
 		}
 		if !equals {
-			dmp := diffmatchpatch.New()
-			legend := dmp.DiffPrettyText(dmp.DiffMain("only in expected", "only in actual", false))
-			return false, fmt.Sprintf("Patched resource didn't match the generated resource in the test result\n(%s)\n\n%s", legend, diff), "Resource diff"
+			return false, "Generated resource didn't match the generated resource in the test result", "Resource diff"
 		}
 	}
 	result := report.ComputePolicyReportResult(false, response, rule)
@@ -185,6 +180,27 @@ func checkResult(test v1alpha1.TestResult, fs billy.Filesystem, resoucePath stri
 		return false, result.Message, fmt.Sprintf("Want %s, got %s", expected, result.Result)
 	}
 	return true, result.Message, "Ok"
+}
+
+func lookupEngineResponses(test v1alpha1.TestResult, resourceName string, responses ...engineapi.EngineResponse) []engineapi.EngineResponse {
+	matches := make([]engineapi.EngineResponse, 0, len(responses))
+	for _, response := range responses {
+		policy := response.Policy()
+		resource := response.Resource
+		pName := cache.MetaObjectToName(policy.MetaObject()).String()
+		rName := cache.MetaObjectToName(&resource).String()
+		if test.Kind != resource.GetKind() {
+			continue
+		}
+		if pName != test.Policy {
+			continue
+		}
+		if resourceName != "" && rName != resourceName && resource.GetName() != resourceName {
+			continue
+		}
+		matches = append(matches, response)
+	}
+	return matches
 }
 
 func lookupRuleResponses(test v1alpha1.TestResult, responses ...engineapi.RuleResponse) []engineapi.RuleResponse {
